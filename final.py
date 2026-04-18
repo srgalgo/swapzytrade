@@ -1,160 +1,182 @@
 import os
 import time
 import threading
+import requests
 from flask import Flask, request
 import telebot
 from telebot import types
 from openai import OpenAI
 
-# --- Configuration & Environment Variables ---
+# --- Configuration ---
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 HF_TOKEN = os.environ.get('HF_TOKEN')
+# Your Platform's Cwallet ID where sellers send crypto for Escrow
+PLATFORM_CWALLET_ID = "YOUR_PLATFORM_CWALLET_ID" 
+CWALLET_API_KEY = os.environ.get('CWALLET_API_KEY') # For automated release
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+client = OpenAI(base_url="https://router.huggingface.co/v1", api_key=HF_TOKEN)
 
-# Hugging Face OpenAI Client
-client = OpenAI(
-    base_url="https://router.huggingface.co/v1",
-    api_key=HF_TOKEN
-)
+# --- Memory Storage (Use a Database for Production) ---
+USER_STATE = {} # {user_id: 'awaiting_buy_amount'}
+ACTIVE_TRADES = {} # {trade_id: {data}}
+APPROVED_USERS = set()
 
-# --- Mock Database & State Management ---
-# In a real app, use a database like PostgreSQL or Redis
-APPROVED_USERS = set()  # Store user IDs of KYC-approved users
-ESCROW_ORDERS = {}      # {order_id: {"user_id": 123, "status": "pending", "timer": object}}
-
-# --- AI Helper Function ---
-def get_ai_response(prompt):
-    try:
-        chat_completion = client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-R1:novita",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500
-        )
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        return f"AI Error: {str(e)}"
-
-# --- Utility: KYC Check ---
-def is_approved(user_id):
-    return user_id in APPROVED_USERS or user_id == 123456789 # Add your Admin ID here
+# --- Cwallet Logic ---
+def release_crypto_via_api(target_cwallet_id, amount_crypto):
+    """
+    Logic to call Cwallet/CCPayment API to transfer crypto.
+    We deduct 2% before calling this.
+    """
+    fee = amount_crypto * 0.02
+    final_amount = amount_crypto - fee
+    
+    # Placeholder for Cwallet API Request
+    # payload = {
+    #     "to_wallet_id": target_cwallet_id,
+    #     "amount": final_amount,
+    #     "asset": "USDT"
+    # }
+    # requests.post("https://api.cwallet.com/v1/transfer", json=payload, headers=headers)
+    
+    print(f"DEBUG: Released {final_amount} to {target_cwallet_id} after {fee} fee.")
+    return True
 
 # --- Keyboards ---
-def main_keyboard():
+def main_menu():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("💰 Buy Crypto", callback_data="buy"),
-        types.InlineKeyboardButton("📉 Sell Crypto", callback_data="sell"),
+        types.InlineKeyboardButton("💰 Buy Crypto", callback_data="buy_init"),
+        types.InlineKeyboardButton("📉 Sell Crypto", callback_data="sell_init"),
         types.InlineKeyboardButton("📊 Today's Price", callback_data="price"),
-        types.InlineKeyboardButton("🔐 KYC Services", callback_data="kyc_tab"),
+        types.InlineKeyboardButton("🔐 KYC Tab", callback_data="kyc_tab"),
         types.InlineKeyboardButton("👤 Admin", callback_data="admin"),
         types.InlineKeyboardButton("❓ Help", callback_data="help")
     )
     return markup
 
-# --- Bot Handlers ---
+# --- Handlers ---
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    welcome_text = "Welcome to the Crypto P2P Bot! 🚀\nChoose an option below:"
-    bot.send_message(message.chat.id, welcome_text, reply_markup=main_keyboard())
+    bot.send_message(message.chat.id, "💎 **Crypto P2P Escrow Bot**\nSecure buying and selling with 2% service fee.", 
+                     reply_markup=main_menu(), parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    user_id = call.from_user.id
+def handle_query(call):
+    uid = call.from_user.id
     
-    if call.data == "buy":
-        bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "Enter amount to buy (Simulated):")
-        # Logic to initiate P2P order...
-        start_escrow_order(call.message.chat.id, user_id, "BUY")
+    if call.data == "sell_init":
+        bot.send_message(call.message.chat.id, "How much crypto do you want to SELL? (Enter amount, e.g. 100)")
+        USER_STATE[uid] = "awaiting_sell_amount"
 
-    elif call.data == "sell":
-        bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "Enter amount to sell (Simulated):")
-        start_escrow_order(call.message.chat.id, user_id, "SELL")
-
-    elif call.data == "price":
-        bot.answer_callback_query(call.id)
-        price_info = "BTC: $65,432\nETH: $3,456\n(Prices synced via AI)"
-        bot.send_message(call.message.chat.id, price_info)
+    elif call.data == "buy_init":
+        bot.send_message(call.message.chat.id, "How much crypto do you want to BUY? (Enter amount, e.g. 100)")
+        USER_STATE[uid] = "awaiting_buy_amount"
 
     elif call.data == "kyc_tab":
-        if is_approved(user_id):
-            bot.edit_message_text("✅ Welcome to the KYC Approved Services Page.\nYou have access to exclusive P2P tools.", 
-                                 call.message.chat.id, call.message.message_id)
+        if uid in APPROVED_USERS:
+            bot.send_message(call.message.chat.id, "✅ KYC Approved. Accessing Premium Services...")
         else:
-            bot.answer_callback_query(call.id, "❌ Access Denied. Complete KYC first.", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ KYC Required!", show_alert=True)
 
-    elif call.data == "admin":
-        bot.send_message(call.message.chat.id, "Admin Panel: /approve [user_id] to grant access.")
+    elif "confirm_payment_" in call.data:
+        trade_id = call.data.split("_")[2]
+        trade = ACTIVE_TRADES.get(trade_id)
+        bot.send_message(trade['seller_id'], f"🚨 Buyer claims payment sent for Trade {trade_id}.\nPlease check your bank/UPI. If received, click below to release crypto.",
+                         reply_markup=release_markup(trade_id))
+        bot.edit_message_text("✅ Notification sent to Seller. Waiting for release.", call.message.chat.id, call.message.message_id)
 
-    elif call.data == "help":
-        help_prompt = "Explain how a crypto P2P escrow works briefly."
-        ai_help = get_ai_response(help_prompt)
-        bot.send_message(call.message.chat.id, f"🤖 AI Support:\n\n{ai_help}")
+    elif "release_crypto_" in call.data:
+        trade_id = call.data.split("_")[2]
+        trade = ACTIVE_TRADES.get(trade_id)
+        
+        # Trigger actual Cwallet Transfer
+        success = release_crypto_via_api(trade['buyer_cwallet'], trade['amount'])
+        
+        if success:
+            bot.send_message(trade['buyer_id'], f"🎉 Crypto Released! {trade['amount'] * 0.98} sent to your Cwallet (2% fee deducted).")
+            bot.send_message(trade['seller_id'], "✅ Trade Completed. Crypto released from escrow.")
+            del ACTIVE_TRADES[trade_id]
 
-# --- Escrow & P2P Logic ---
+# --- Text Input Handler (Amounts & IDs) ---
 
-def start_escrow_order(chat_id, user_id, side):
-    order_id = f"ORD-{int(time.time())}"
-    bot.send_message(chat_id, f"📝 Order {order_id} Created ({side}).\nStatus: Waiting for Payment.\n⏳ Timer: 15 minutes to complete.")
-    
-    # Auto-release/Cancel Timer (Simulated)
-    timer = threading.Timer(900, expire_order, [chat_id, order_id])
-    ESCROW_ORDERS[order_id] = {"user_id": user_id, "status": "pending", "timer": timer}
-    timer.start()
+@bot.message_handler(func=lambda m: True)
+def handle_text(message):
+    uid = message.from_user.id
+    state = USER_STATE.get(uid)
 
-def expire_order(chat_id, order_id):
-    if order_id in ESCROW_ORDERS and ESCROW_ORDERS[order_id]["status"] == "pending":
-        bot.send_message(chat_id, f"⚠️ Order {order_id} Expired. Crypto returned to escrow.")
-        del ESCROW_ORDERS[order_id]
+    if state == "awaiting_sell_amount":
+        amount = message.text
+        trade_id = str(int(time.time()))
+        ACTIVE_TRADES[trade_id] = {'seller_id': uid, 'amount': float(amount), 'status': 'escrow_pending'}
+        
+        msg = f"📝 **Sell Order {trade_id}**\n\nTo start escrow, send {amount} crypto to:\n" \
+              f"📍 **Cwallet ID:** `{PLATFORM_CWALLET_ID}`\n\n" \
+              "After sending, the crypto will be locked in our system."
+        bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+        USER_STATE[uid] = None
 
-@bot.message_handler(commands=['complete'])
-def complete_order(message):
-    # Simulated completion: In reality, you'd check Cwallet API Webhook here
-    bot.reply_to(message, "✅ Payment Verified. Releasing Crypto from Escrow...")
-    time.sleep(2)
-    bot.send_message(message.chat.id, "🎉 Success! Crypto has been released to your Cwallet.")
+    elif state == "awaiting_buy_amount":
+        amount = message.text
+        USER_STATE[uid] = f"awaiting_buyer_cwallet_{amount}"
+        bot.send_message(message.chat.id, "Please provide your **Cwallet ID** to receive crypto after payment:")
 
-# --- Admin Commands ---
+    elif state and "awaiting_buyer_cwallet_" in state:
+        amount = float(state.split("_")[3])
+        buyer_cwallet = message.text
+        trade_id = str(int(time.time()))
+        
+        # In a real app, you'd match this with an existing Seller's order. 
+        # Here we simulate finding a seller.
+        seller_payment_details = "UPI: example@upi | Bank: 1234567890 (IMPS)"
+        
+        ACTIVE_TRADES[trade_id] = {
+            'buyer_id': uid, 
+            'buyer_cwallet': buyer_cwallet,
+            'amount': amount,
+            'seller_id': 12345678, # Hardcoded demo seller ID
+            'status': 'payment_pending'
+        }
+        
+        msg = f"🛒 **Buy Order {trade_id}**\n\nAmount: {amount} Crypto\n" \
+              f"Please pay the seller here:\n💰 `{seller_payment_details}`\n\n" \
+              "Click the button below ONLY after you have transferred the money."
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ I Have Paid", callback_data=f"confirm_payment_{trade_id}"))
+        bot.send_message(message.chat.id, msg, reply_markup=markup, parse_mode="Markdown")
+        USER_STATE[uid] = None
 
+def release_markup(trade_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔓 Release Crypto", callback_data=f"release_crypto_{trade_id}"))
+    return markup
+
+# --- Admin & KYC Simulation ---
 @bot.message_handler(commands=['approve'])
-def approve_user(message):
+def approve(message):
     try:
-        target_id = int(message.text.split()[1])
-        APPROVED_USERS.add(target_id)
-        bot.reply_to(message, f"User {target_id} is now KYC Approved!")
+        target = int(message.text.split()[1])
+        APPROVED_USERS.add(target)
+        bot.reply_to(message, f"User {target} KYC Approved.")
     except:
         bot.reply_to(message, "Usage: /approve [user_id]")
 
-# --- Flask Server for Render ---
-
+# --- Flask Server ---
 @app.route('/' + BOT_TOKEN, methods=['POST'])
 def getMessage():
-    json_string = request.get_data().decode('utf-8')
-    update = telebot.types.Update.de_json(json_string)
-    bot.process_new_updates([update])
+    bot.process_new_updates([telebot.types.Update.de_json(request.get_data().decode('utf-8'))])
     return "!", 200
 
 @app.route("/")
 def webhook():
-    bot.remove_webhook()
-    # Replace with your actual Render URL after deployment
-    # bot.set_webhook(url='https://your-app-name.onrender.com/' + BOT_TOKEN)
-    return "Bot is running", 200
+    return "Bot logic is active", 200
 
 if __name__ == "__main__":
-    # For local testing, use bot.polling(). 
-    # For Render production, the Flask app keeps the service alive.
     if os.environ.get('RENDER'):
-        # In production on Render
-        bot.remove_webhook()
-        # You would set webhook here, but for simplicity, many users use polling 
-        # with a background thread or a simple loop.
         threading.Thread(target=bot.infinity_polling).start()
         app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
     else:
-        # Local development
         bot.infinity_polling()
